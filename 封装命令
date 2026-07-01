@@ -1,0 +1,1 @@
+.\venv\Scripts\python -m PyInstaller --onedir --noconsole --icon=app.ico --add-data "app.ico;." --name="IPMonitor" IPMonitor.py
