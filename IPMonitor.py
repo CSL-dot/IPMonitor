@@ -24,7 +24,7 @@ TIMEOUT = 5  # 检测超时时间（秒）
 CHECK_INTERVAL = 10  # 检测间隔（秒）
 LOG_FOLDER = "ip_monitor_logs"
 PROTOCOLS = ["http://", "https://"]
-MAX_THREADS = 10  # 线程池最大线程数
+MAX_THREADS = 50  # 线程池最大线程数
 
 # 初始化日志目录
 if not os.path.exists(LOG_FOLDER):
@@ -70,8 +70,19 @@ def ping_check(ip: str, timeout_ms: int = 1000) -> Tuple[bool, str]:
     cmd = ["ping", "-n", "1", "-w", str(timeout_ms), clean_ip] if is_win else \
         ["ping", "-c", "1", "-W", str(int(timeout_ms / 1000)), clean_ip]
 
+    # 动态参数字典，避免在 Linux/macOS 上传入 Windows 专属参数引发异常
+    run_kwargs = {
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "timeout": (timeout_ms / 1000) + 1
+    }
+
+    # 核心修复：如果是 Windows 系统，注入 0x08000000 (CREATE_NO_WINDOW) 标志，强制静默执行
+    if is_win:
+        run_kwargs["creationflags"] = 0x08000000
+
     try:
-        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=(timeout_ms / 1000) + 1)
+        res = subprocess.run(cmd, **run_kwargs)
         if res.returncode == 0:
             return True, "Ping 成功"
         return False, "Ping 失败 (超时/不可达)"
@@ -495,6 +506,9 @@ class IPMonitorApp:
         # 核心改进：采用 thread-local 保证连接池（Keep-Alive）的线程隔离与线程安全
         self.thread_local = threading.local()
 
+        # 心跳记录：维护当前整点，每小时写入一次日志作为“运行中”的断点凭证
+        self.last_heartbeat_hour: int = None
+
         # ------------------ UI构建与调度 ------------------
         self._set_style()
         self._create_widgets()
@@ -709,6 +723,15 @@ class IPMonitorApp:
         self.thread_pool.submit(self.collect_results_as_completed, futures_map)
 
     def collect_results_as_completed(self, futures_map: dict):
+        # 1. 测算当前整点，判定是否需要写入整点状态心跳记录
+        now_dt = datetime.now()
+        current_hour = now_dt.hour
+        write_heartbeat = False
+
+        if self.last_heartbeat_hour is None or self.last_heartbeat_hour != current_hour:
+            self.last_heartbeat_hour = current_hour
+            write_heartbeat = True  # 触发整点心跳写入保护
+
         for future in as_completed(futures_map):
             if not self.is_running:
                 break
@@ -719,15 +742,18 @@ class IPMonitorApp:
             except Exception as e:
                 station, ip, ok, msg = station, ip, False, f"检测异常崩溃: {str(e)[:30]}"
 
-            now = datetime.now()
-            current_full_time = now.strftime('%Y-%m-%d %H:%M:%S')
-            current_time_only = now.strftime('%H:%M:%S')
+            current_full_time = now_dt.strftime('%Y-%m-%d %H:%M:%S')
+            current_time_only = now_dt.strftime('%H:%M:%S')
 
             status_desc = "正常连接" if ok else "断开连接"
+            # 如果是心跳写入，添加“心跳”后缀标识
+            heartbeat_suffix = " (心跳)" if write_heartbeat else ""
             log_msg_detail = status_desc + (f" ({msg})" if not ok else "")
 
             prev_status = self.station_current_status.get(station)
-            if prev_status is None or prev_status != ok:
+
+            # 2. 如果满足【状态发生变更】或者【到达下一个整点心跳时刻】，则写入磁盘文件
+            if prev_status is None or prev_status != ok or write_heartbeat:
                 log_msg = f"{current_full_time} - {station}({ip}) - {log_msg_detail}"
                 try:
                     with open(self.get_log_file_by_date(date.today()), "a", encoding="utf-8") as f:
@@ -762,13 +788,6 @@ class IPMonitorApp:
             logging.info(f"检测到日期更替：{self.today} → {current_date}")
             self.yesterday = self.today
             self.today = current_date
-
-            if self.ip_list:
-                for station, _, _ in self.ip_list:
-                    self.station_current_status[station] = None
-                    self.station_first_status_time[station] = (None, "")
-
-                self._load_history_logs_async([s for s, _, _ in self.ip_list])
 
         self.root.after(10000, self._schedule_date_check)
 
@@ -809,7 +828,7 @@ class IPMonitorApp:
             self.timeline_bars[station] = timeline_bar
 
             sep = ttk.Separator(self.scrollable_list.scrollable_frame, orient="horizontal")
-            sep.pack(fill=tk.X, padx=5, pady=0)
+            sep.pack(fill=tk.X, padx=5)
 
     def _load_config(self, file_path: str):
         def task():
@@ -853,12 +872,25 @@ class IPMonitorApp:
         self._update_summary_label()
 
     def _update_summary_label(self):
-        """刷新看板顶部节点汇总指标"""
+        """刷新看板顶部节点汇总指标，并自适应列出故障站点名称"""
         online_count = sum(1 for s, _, _ in self.ip_list if self.station_current_status.get(s) is True)
-        offline_count = sum(1 for s, _, _ in self.ip_list if self.station_current_status.get(s) is False)
+
+        # 提取当前所有状态为故障（False）的站点名称
+        offline_stations = [s for s, _, _ in self.ip_list if self.station_current_status.get(s) is False]
+        offline_count = len(offline_stations)
+
+        # 动态构造故障详情信息，限制最大显示 5 个站名，避免大批量断线时撑爆 UI
+        if offline_count > 0:
+            if offline_count <= 5:
+                stations_detail = f" ({', '.join(offline_stations)})"
+            else:
+                stations_detail = f" ({', '.join(offline_stations[:5])}... 等{offline_count}个)"
+        else:
+            stations_detail = ""
+
         total_nodes = len(self.ip_list)
         self.summary_label.config(
-            text=f"节点总数: {total_nodes}  |  在线: {online_count}  |  故障: {offline_count}"
+            text=f"节点总数: {total_nodes}  |  在线: {online_count}  |  故障: {offline_count}{stations_detail}"
         )
 
     def _process_queue(self):
@@ -893,7 +925,6 @@ class IPMonitorApp:
         self.thread_pool.shutdown(wait=False)
         # 本地线程 Session 将随线程销毁自动被垃圾回收机制释放
         try:
-            import sys
             sys.exit(0)
         except Exception:
             pass
